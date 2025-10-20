@@ -1,12 +1,10 @@
+# server.py — Telegram bot via LONG POLLING (no web server)
 import os, re, sqlite3, datetime as dt
-from typing import List, Tuple
-from fastapi import FastAPI, Request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, AIORateLimiter
+from typing import List
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-SECRET_PATH = os.environ.get("SECRET_PATH", "hook")  # הגן על ה-webhook בנתיב נסתר, לדוגמה: x9ab123
-
 DB_PATH = "pf_agent.db"
 
 # ---------- DB ----------
@@ -87,7 +85,6 @@ def build_scenarios(user_id: str, goal_title: str, target_value: float, target_d
         ("נועז","כרית מזומן 15–20%, הוספות על ירידות עם Stop-Loss 8%")
     ]
     conn=db(); cur=conn.cursor()
-    created=[]
     for name, rationale in profiles:
         cur.execute("INSERT INTO scenarios(user_id,name,profile,rationale) VALUES(?,?,?,?)",
                     (user_id, name, name, rationale))
@@ -102,9 +99,7 @@ def build_scenarios(user_id: str, goal_title: str, target_value: float, target_d
         for due, action, amount, notes in steps:
             cur.execute("""INSERT INTO scenario_steps(scenario_id,due_date,action,amount,notes,status)
                            VALUES(?,?,?,?,?,?)""",(sid, due.isoformat(), action, amount, notes, "todo"))
-        created.append(sid)
     conn.commit(); conn.close()
-    return created
 
 def scenario_status(user_id: str) -> str:
     conn=db(); cur=conn.cursor()
@@ -113,10 +108,7 @@ def scenario_status(user_id: str) -> str:
                    WHERE s.user_id=? ORDER BY st.due_date ASC""",(user_id,))
     rows = cur.fetchall(); conn.close()
     if not rows: return "אין צעדים כרגע. כתוב 'תרחישים' כדי ליצור."
-    out=[]
-    for r in rows:
-        out.append(f"[{r['name']}] {r['due_date']}: {r['action']} — {r['status']}")
-    return "\n".join(out)
+    return "\n".join(f"[{r['name']}] {r['due_date']}: {r['action']} — {r['status']}" for r in rows)
 
 def parse_goal(text: str):
     m_val = re.search(r'(\d[\d,\.]*)', text)
@@ -125,23 +117,19 @@ def parse_goal(text: str):
     target_date  = m_date.group(1) if m_date else (dt.date.today()+dt.timedelta(days=100)).isoformat()
     return target_value, target_date
 
-# ---------- Telegram app (webhook) ----------
-app = FastAPI()
-application = Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
-
-from telegram import ReplyKeyboardMarkup, KeyboardButton
+# ---------- Telegram ----------
 KB = ReplyKeyboardMarkup(
     [[KeyboardButton("יעד לדוגמה"), KeyboardButton("תרחישים")],
      [KeyboardButton("סטטוס"), KeyboardButton("חוקי סיכון")]],
     resize_keyboard=True
 )
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     uid = str(update.effective_user.id)
     ensure_guardrails(uid)
-    # מאזן התחלתי לדוגמה – תוכל לעדכן מול הבוט:
     if not list_accounts(uid):
+        # ברירת מחדל: 15K ₪ מחולק — תוכל לעדכן בצ'אט
         upsert_account(uid, "MONDAY", "equity", "ILS", 5000.0)
         upsert_account(uid, "S&P 500", "fund", "ILS", 5000.0)
         upsert_account(uid, "BankIndex", "fund", "ILS", 5000.0)
@@ -152,10 +140,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=KB
     )
 
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("פקודות: /start /help + הודעות חופשיות (יעד/תרחישים/סטטוס/חוקי סיכון/מאזן/חשבון ...)")
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("פקודות: /start /help + 'יעד' / 'תרחישים' / 'סטטוס' / 'חוקי סיכון' / 'מאזן' / 'חשבון MONDAY 7000'")
 
-async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     uid = str(update.effective_user.id)
     ensure_guardrails(uid)
@@ -165,17 +153,13 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "יעד 6000 עד 2026-01-31"
 
     if any(k in text for k in ["חוקי", "guard", "סיכון"]):
-        await update.message.reply_text(
-            "חוקי סיכון:\n• Max position ≤ 15%\n• Cash buffer ≥ 20%\n• Stop-loss −8%\n• Max monthly drawdown −5%"
-        ); return
+        await update.message.reply_text("חוקי סיכון:\n• Max position ≤ 15%\n• Cash buffer ≥ 20%\n• Stop-loss −8%\n• Max monthly drawdown −5%"); return
 
     if text in ("מאזן", "יתרות"):
         rows = list_accounts(uid)
         if not rows:
-            await update.message.reply_text("אין חשבונות. עדכן: 'חשבון MONDAY 7000'")
-            return
-        await update.message.reply_text("מאזן:\n" + "\n".join([f"• {r['name']}: {r['balance']:.0f} {r['currency']}" for r in rows]))
-        return
+            await update.message.reply_text("אין חשבונות. עדכן: 'חשבון MONDAY 7000'"); return
+        await update.message.reply_text("מאזן:\n" + "\n".join([f"• {r['name']}: {r['balance']:.0f} {r['currency']}" for r in rows])); return
 
     if text.startswith("חשבון "):
         m = re.match(r"חשבון\s+(.+?)\s+(\d+(?:\.\d+)?)", text)
@@ -202,20 +186,15 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("היי 🙌 כתוב: יעד / תרחישים / סטטוס / חוקי סיכון / מאזן / חשבון ...")
 
-# חיבור ההנדלרים
-application.add_handler(CommandHandler("start", start_handler))
-application.add_handler(CommandHandler("help", help_handler))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.post(f"/{SECRET_PATH}")
-async def telegram_webhook(request: Request):
+def main():
     if not BOT_TOKEN:
-        return {"error": "BOT_TOKEN missing"}
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return {"ok": True}
+        raise SystemExit("BOT_TOKEN env var is missing")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
+    print("🤖 Bot is running (long polling).")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()
